@@ -5,9 +5,15 @@ const STATIC_TOKEN = 'eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwidHlwIjoiU0FUIiwiY2
 const BASE_URL = '..';
 
 let client;
-let roomSession;
+let call;
 let cardsRevealed = false;
 let isMuted = false;
+// v4: track every RxJS Subscription so teardown can unsubscribe them all
+let subscriptions = [];
+let currentLocalStream = null;
+let remoteVideoEl = null;
+let lastRemoteSig = '';
+let teardownDone = false;
 const cards = {
     past: null,
     present: null,
@@ -30,7 +36,7 @@ function logEvent(message, data = null, isUserEvent = false) {
     const entry = document.createElement('div');
     entry.className = isUserEvent ? 'event-entry user-event' : 'event-entry';
     const time = new Date().toLocaleTimeString();
-    
+
     let dataStr = '';
     if (data) {
         try {
@@ -49,7 +55,7 @@ function logEvent(message, data = null, isUserEvent = false) {
             dataStr = 'Error serializing data: ' + e.message;
         }
     }
-    
+
     entry.innerHTML = `
         <div class="event-time">${time}</div>
         <div>${isUserEvent ? '🔴 USER EVENT: ' : ''}${message}</div>
@@ -59,548 +65,305 @@ function logEvent(message, data = null, isUserEvent = false) {
     eventEntries.scrollTop = eventEntries.scrollHeight;
 }
 
-// Initialize SignalWire client (without dialing)
+// Prepare the "Ready to connect" state (no dialing yet)
 async function initializeClient() {
     try {
         statusDiv.textContent = 'Ready to connect';
         logEvent('Client ready - click Connect to dial');
-        
     } catch (error) {
         logEvent('Initialization error', { error: error.message });
         statusDiv.textContent = 'Initialization failed';
     }
 }
 
-// Connect to call with static token
+// --- v4 helpers ---------------------------------------------------------
+
+// Track an RxJS subscription for later teardown
+function track(sub) {
+    if (sub) subscriptions.push(sub);
+    return sub;
+}
+
+// Build a stable signature for a stream's track set (kind:id, sorted)
+function streamSignature(stream) {
+    return stream.getTracks().map(t => t.kind + ':' + t.id).sort().join(',');
+}
+
+// Gate the dial on the client actually connecting.
+// isConnected$ replays synchronously on subscribe (settle via flag, defer the
+// unsubscribe) and never errors on bad creds (add a timeout or the UI hangs).
+function waitForConnected(swClient, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let sub = null;
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            if (sub) { try { sub.unsubscribe(); } catch (e) {} }
+            reject(new Error('Timed out waiting for SignalWire connection'));
+        }, timeoutMs);
+        sub = swClient.isConnected$.subscribe(connected => {
+            if (connected && !settled) {
+                settled = true;
+                clearTimeout(timer);
+                setTimeout(() => { if (sub) { try { sub.unsubscribe(); } catch (e) {} } }, 0);
+                resolve();
+            }
+        });
+    });
+}
+
+// Render the remote (Sigmond avatar) stream ourselves. Leave it UNMUTED — it
+// carries the remote audio, and connect is user-gesture-initiated so
+// autoplay-with-sound is allowed. Re-attach whenever the track set changes: the
+// SDK re-emits the same MediaStream as tracks arrive and Chromium may otherwise
+// never render a late video track.
+function attachRemoteStream(stream) {
+    if (!stream) return;
+    const container = document.getElementById('video-container');
+    if (!container) return;
+
+    if (!remoteVideoEl) {
+        remoteVideoEl = document.createElement('video');
+        remoteVideoEl.autoplay = true;
+        remoteVideoEl.playsInline = true;
+        remoteVideoEl.setAttribute('playsinline', '');
+        remoteVideoEl.style.width = '100%';
+        remoteVideoEl.style.height = '100%';
+        remoteVideoEl.style.objectFit = 'cover';
+        container.appendChild(remoteVideoEl);
+    }
+
+    const sig = streamSignature(stream);
+    if (sig !== lastRemoteSig) {
+        lastRemoteSig = sig;
+        remoteVideoEl.srcObject = stream;
+        remoteVideoEl.play().catch(err =>
+            logEvent('Remote video play() blocked', { error: err.message }));
+        logEvent('Remote stream attached', { tracks: sig });
+    }
+}
+
+// Local self-preview. MUTED so the seeker never monitors their own mic.
+function attachLocalStream(stream) {
+    currentLocalStream = stream || null;
+    if (!stream) return;
+    const localVideoContainer = document.getElementById('local-video-container');
+    const localVideo = document.getElementById('local-video');
+    if (localVideo && localVideo.srcObject !== stream) {
+        localVideo.srcObject = stream;
+        localVideo.muted = true;
+        if (localVideo.play) localVideo.play().catch(() => {});
+        const videoTracks = stream.getVideoTracks();
+        if (videoTracks.length) {
+            const s = videoTracks[0].getSettings();
+            logEvent('Local video preview started', {
+                label: videoTracks[0].label, width: s.width, height: s.height
+            });
+        }
+    }
+    if (localVideoContainer) {
+        localVideoContainer.style.display = 'block';
+        localVideoContainer.classList.add('connected');
+    }
+}
+
+// UI transition when the call reaches 'connected'
+function onConnected() {
+    statusDiv.textContent = 'Connected to Sigmond';
+    connectBtn.style.display = 'none';
+    hangupBtn.style.display = 'inline-block';
+    muteBtn.style.display = 'inline-block';
+
+    const controlsContainer = document.querySelector('.controls-container');
+    if (controlsContainer) controlsContainer.classList.add('connected');
+
+    // Make buttons ultra compact on mobile
+    if (window.innerWidth <= 768) {
+        hangupBtn.textContent = '✕';
+        muteBtn.textContent = '🔇';
+    }
+
+    // Hide the deck placeholder
+    const deckPlaceholder = document.getElementById('deck-placeholder');
+    if (deckPlaceholder) deckPlaceholder.style.display = 'none';
+
+    // Honor "start muted" once we are connected
+    if (startMutedCheckbox && startMutedCheckbox.checked && !isMuted) {
+        toggleMute();
+    }
+}
+
+// --- Connection (v4) ----------------------------------------------------
+
 async function connectToCall() {
     try {
         // Disable button and show connecting state
         connectBtn.disabled = true;
         connectBtn.textContent = '⏳ Connecting...';
         connectBtn.style.cssText = 'background: linear-gradient(45deg, #808080, #606060) !important;';
-        
-        // Clear previous event log entries
+
+        // Reset per-connection state
         eventEntries.innerHTML = '';
+        teardownDone = false;
+        subscriptions = [];
+        remoteVideoEl = null;
+        lastRemoteSig = '';
+        currentLocalStream = null;
         logEvent('Starting new connection...');
-        
+
         if (!STATIC_TOKEN || STATIC_TOKEN === 'YOUR_SIGNALWIRE_TOKEN_HERE') {
             throw new Error('Please update STATIC_TOKEN with your actual SignalWire token');
         }
-        
+
+        // UMD global is window.SignalWire
+        const SignalWireSDK = window.SignalWire || SignalWire;
+        if (!SignalWireSDK || typeof SignalWireSDK.SignalWire !== 'function') {
+            throw new Error('SignalWire v4 SDK not loaded');
+        }
+
         statusDiv.textContent = 'Initializing client...';
         logEvent('Using static token', { tokenLength: STATIC_TOKEN.length });
 
-        // Initialize client with debug options
-        // SignalWire should be available on window when using UMD build
-        const SignalWireSDK = window.SignalWire || SignalWire;
-        logEvent('SignalWire SDK check', { 
-            hasWindow: typeof window !== 'undefined',
-            hasSignalWire: typeof SignalWire !== 'undefined',
-            hasWindowSignalWire: typeof window.SignalWire !== 'undefined',
-            SignalWireType: typeof SignalWireSDK,
-            SignalWireKeys: SignalWireSDK ? Object.keys(SignalWireSDK) : []
-        });
+        // v4: constructor auto-connects; class, not factory. A guest SAT works as
+        // a plain bearer via StaticCredentialProvider.
+        client = new SignalWireSDK.SignalWire(
+            new SignalWireSDK.StaticCredentialProvider({ token: STATIC_TOKEN })
+        );
 
-        // Based on the keys, we need to use Fabric
-        if (typeof SignalWireSDK.Fabric === 'function') {
-            client = await SignalWireSDK.Fabric({
-                token: STATIC_TOKEN,
-                logLevel: 'debug',
-                debug: { logWsTraffic: false }
-            });
-        } else if (typeof SignalWireSDK.SignalWire === 'function') {
-            client = await SignalWireSDK.SignalWire({
-                token: STATIC_TOKEN,
-                logLevel: 'debug',
-                debug: { logWsTraffic: false }
-            });
-        } else {
-            throw new Error('SignalWire SDK not found or not a function');
-        }
+        // v4: surface SDK errors/warnings (replaces logLevel: 'debug')
+        track(client.errors$.subscribe(e =>
+            logEvent('SDK error', { code: e && e.code, message: e && e.message })));
+        track(client.warnings$.subscribe(w =>
+            logEvent('SDK warning', { code: w && w.code, message: w && w.message })));
 
-        logEvent('Client initialized');
+        statusDiv.textContent = 'Connecting to SignalWire...';
+        await waitForConnected(client, 15000);
+        logEvent('Client connected');
 
-        // Subscribe to ALL events on the client to debug
-        const originalEmit = client.emit;
-        client.emit = function(event, ...args) {
-            if (event !== 'signalwire.socket.message' && event !== 'signalwire.socket.open') {
-                logEvent(`Client event: ${event}`, args[0]);
-            }
-            return originalEmit.apply(this, [event, ...args]);
-        };
-        
-        // Client-level disconnect handling
-        client.on('signalwire.disconnect', (params) => {
-            logEvent('Client disconnected', params);
-            handleDisconnect();
-        });
-        
-        client.on('signalwire.error', (params) => {
-            logEvent('Client error', params);
-            if (params && params.error && params.error.includes('disconnect')) {
-                handleDisconnect();
+        statusDiv.textContent = 'Dialing...';
+        // video: true  -> send the seeker's camera (the agent has vision enabled and
+        //                 comments on the seeker's appearance via get_visual_input)
+        // receiveVideo  -> receive Sigmond's avatar video
+        call = await client.dial(DESTINATION, {
+            audio: true,
+            video: true,
+            receiveAudio: true,
+            receiveVideo: true,
+            userVariables: {
+                userName: 'Tarot Reader',
+                interface: 'sw-js-v4-static',
+                extension: 'sigmond_tarot'
             }
         });
+        logEvent('Dial initiated', { destination: DESTINATION });
 
-        // Try multiple event patterns
-        client.on('user_event', (params) => {
-            console.log('🔴 CLIENT EVENT: user_event (no prefix)', params);
-            logEvent('user_event (no prefix)', params, true);
-            handleUserEvent(params);
-        });
+        // Remote avatar video + audio
+        track(call.remoteStream$.subscribe(stream => attachRemoteStream(stream)));
 
-        client.on('calling.user_event', (params) => {
-            console.log('🟠 CLIENT EVENT: calling.user_event', params);
-            logEvent('calling.user_event', params, true);
-            handleUserEvent(params);
-        });
+        // Local self-preview
+        track(call.localStream$.subscribe(stream => attachLocalStream(stream)));
 
-        client.on('signalwire.event', (params) => {
-            console.log('🟡 CLIENT EVENT: signalwire.event', params);
-            if (params.event_type === 'user_event') {
-                console.log('✅ Found user_event in signalwire.event!', params.params);
-                logEvent('Found user_event in signalwire.event', params.params, true);
-                handleUserEvent(params.params || params);
-            } else {
-                logEvent('signalwire.event', params);
-            }
-        });
+        // Single user_event subscription. SWML user_event wraps its payload under
+        // `.event`; add_action('user_event', {...}) would be flat — tolerate both.
+        track(call.subscribe('user_event').subscribe(evt => {
+            const params = (evt && evt.params) ? evt.params : evt;
+            const payload = (params && params.event) ? params.event : params;
+            logEvent('user_event', payload, true);
+            handleUserEvent(payload);
+        }));
 
-        statusDiv.textContent = 'Getting media devices...';
-        
-        // First get permission to access devices to see their labels
-        try {
-            // Request permission to get device labels
-            const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-            tempStream.getTracks().forEach(track => track.stop()); // Stop the temp stream
-            
-            // Now enumerate devices with labels
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const audioInputs = devices.filter(d => d.kind === 'audioinput');
-            const videoInputs = devices.filter(d => d.kind === 'videoinput');
-            
-            // Find the default devices - on macOS, they often have "Default" in the label
-            let audioDeviceId = undefined;
-            let videoDeviceId = undefined;
-            
-            // Look for devices with "Default" in the label first
-            const defaultAudio = audioInputs.find(d => d.label.toLowerCase().includes('default'));
-            const defaultVideo = videoInputs.find(d => d.label.toLowerCase().includes('default'));
-            
-            if (defaultAudio) {
-                audioDeviceId = defaultAudio.deviceId;
-                logEvent('Found default audio device', { label: defaultAudio.label, deviceId: defaultAudio.deviceId });
-            } else if (audioInputs.length > 0) {
-                // If no "default" device, use the first one
-                audioDeviceId = audioInputs[0].deviceId;
-                logEvent('Using first audio device', { label: audioInputs[0].label, deviceId: audioInputs[0].deviceId });
-            }
-            
-            if (defaultVideo) {
-                videoDeviceId = defaultVideo.deviceId;
-                logEvent('Found default video device', { label: defaultVideo.label, deviceId: defaultVideo.deviceId });
-            } else if (videoInputs.length > 0) {
-                // If no "default" device, use the first one
-                videoDeviceId = videoInputs[0].deviceId;
-                logEvent('Using first video device', { label: videoInputs[0].label, deviceId: videoInputs[0].deviceId });
-            }
-            
-            statusDiv.textContent = 'Dialing...';
-            
-            // Dial into the room with specific devices
-            roomSession = await client.dial({
-                to: DESTINATION,
-                rootElement: document.getElementById('video-container'),
-                audio: audioDeviceId ? { deviceId: { exact: audioDeviceId } } : true,
-                video: videoDeviceId ? { deviceId: { exact: videoDeviceId } } : true,
-                negotiateVideo: true,
-                userVariables: {
-                    userName: 'Tarot Reader',
-                    interface: 'raw-sdk-static',
-                    timestamp: new Date().toISOString(),
-                    extension: 'sigmond_tarot'
-                }
-            });
-        } catch (error) {
-            logEvent('Error getting devices', { error: error.message });
-            statusDiv.textContent = 'Dialing with browser defaults...';
-            
-            // Fallback to letting browser choose
-            roomSession = await client.dial({
-                to: DESTINATION,
-                rootElement: document.getElementById('video-container'),
-                audio: true,
-                video: true,
-                negotiateVideo: true,
-                userVariables: {
-                    userName: 'Tarot Reader',
-                    interface: 'raw-sdk-static',
-                    timestamp: new Date().toISOString(),
-                    extension: 'sigmond_tarot'
-                }
-            });
-        }
-
-        logEvent('Dial initiated');
-
-        // Subscribe to room session events
-        roomSession.on('room.started', (params) => {
-            logEvent('room.started', params);
-        });
-
-        roomSession.on('call.joined', (params) => {
-            logEvent('call.joined', params);
-            statusDiv.textContent = 'Connected to Sigmond';
-            connectBtn.style.display = 'none';
-            hangupBtn.style.display = 'inline-block';
-            muteBtn.style.display = 'inline-block';
-            
-            // Add connected class to controls container for proper positioning
-            const controlsContainer = document.querySelector('.controls-container');
-            if (controlsContainer) {
-                controlsContainer.classList.add('connected');
-            }
-            
-            // Make buttons ultra compact on mobile
-            if (window.innerWidth <= 768) {
-                hangupBtn.textContent = '✕';
-                muteBtn.textContent = '🔇';
-            }
-            
-            // Hide the deck placeholder
-            const deckPlaceholder = document.getElementById('deck-placeholder');
-            if (deckPlaceholder) {
-                deckPlaceholder.style.display = 'none';
-            }
-            
-            // Show local video preview
-            const localVideoContainer = document.getElementById('local-video-container');
-            const localVideo = document.getElementById('local-video');
-            if (localVideoContainer && localVideo && roomSession.localStream) {
-                // Clone the stream to avoid affecting the main stream
-                const localStreamClone = roomSession.localStream.clone();
-                localVideo.srcObject = localStreamClone;
-                localVideoContainer.style.display = 'block';
-                localVideoContainer.classList.add('connected');
-                
-                // Log video device being used
-                const videoTracks = roomSession.localStream.getVideoTracks();
-                videoTracks.forEach(track => {
-                    const settings = track.getSettings();
-                    logEvent('Video input device', {
-                        label: track.label,
-                        deviceId: settings.deviceId,
-                        width: settings.width,
-                        height: settings.height,
-                        frameRate: settings.frameRate
-                    });
-                });
-                
-                logEvent('Local video preview started');
-            }
-            
-            // Log audio output device (system will use OS default automatically)
-            const videoElement = document.querySelector('#video-container video');
-            if (videoElement && typeof videoElement.setSinkId === 'function') {
-                // Log current audio output device
-                navigator.mediaDevices.enumerateDevices()
-                    .then(devices => {
-                        const audioOutputs = devices.filter(device => device.kind === 'audiooutput');
-                        
-                        // The current sinkId will show which device is being used
-                        const currentOutput = audioOutputs.find(device => device.deviceId === videoElement.sinkId);
-                        
-                        logEvent('Audio output device', {
-                            count: audioOutputs.length,
-                            currentDevice: currentOutput ? currentOutput.label : 'System Default',
-                            sinkId: videoElement.sinkId || 'default'
-                        });
-                    });
-            } else {
-                logEvent('setSinkId not supported - using browser default audio output');
-            }
-        });
-
-        roomSession.on('member.joined', (params) => {
-            logEvent('member.joined', params);
-        });
-
-        roomSession.on('member.left', (params) => {
-            logEvent('member.left', params);
-        });
-
-        roomSession.on('room.left', (params) => {
-            logEvent('room.left', params);
-            handleDisconnect();
-        });
-
-        roomSession.on('destroy', (params) => {
-            logEvent('destroy', params);
-            handleDisconnect();
-        });
-        
-        // Additional events for remote hangup detection
-        roomSession.on('call.ended', (params) => {
-            logEvent('call.ended', params);
-            handleDisconnect();
-        });
-        
-        roomSession.on('room.ended', (params) => {
-            logEvent('room.ended', params);
-            handleDisconnect();
-        });
-        
-        roomSession.on('disconnected', (params) => {
-            logEvent('disconnected', params);
-            handleDisconnect();
-        });
-        
-        // Additional events that might fire on remote hangup
-        roomSession.on('call.state', (params) => {
-            logEvent('call.state', params);
-            if (params && (params.state === 'ended' || params.state === 'disconnected')) {
-                handleDisconnect();
-            }
-        });
-        
-        roomSession.on('session.ended', (params) => {
-            logEvent('session.ended', params);
-            handleDisconnect();
-        });
-        
-        roomSession.on('member.updated', (params) => {
-            if (params && params.member && params.member.state === 'left') {
-                logEvent('member.updated - member left', params);
-                // Check if this is the remote party leaving
-                if (params.member.id !== roomSession.memberId) {
+        // Call lifecycle
+        track(call.status$.subscribe({
+            next: (status) => {
+                logEvent('call.status', { status });
+                if (status === 'connected') {
+                    onConnected();
+                } else if (status === 'disconnected' || status === 'failed' || status === 'destroyed') {
                     handleDisconnect();
                 }
-            }
-        });
+            },
+            // The SDK completes the subject on destroy, sometimes without a
+            // terminal status — treat completion as a teardown too.
+            complete: () => handleDisconnect()
+        }));
 
-        // Watch for when localStream becomes available
-        const checkLocalStream = setInterval(() => {
-            if (roomSession && roomSession.localStream) {
-                clearInterval(checkLocalStream);
-                logEvent('Local stream found');
-                
-                const audioTracks = roomSession.localStream.getAudioTracks();
-                
-                // Apply gain to the audio stream
-                if (audioTracks.length > 0) {
-                    try {
-                        // Create audio context and gain node
-                        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                        const source = audioContext.createMediaStreamSource(roomSession.localStream);
-                        const gainNode = audioContext.createGain();
-                        const destination = audioContext.createMediaStreamDestination();
-                        
-                        // Set gain value (1.0 = no change, 2.0 = double volume, etc.)
-                        const gainValue = 3.0; // Adjust this value to control gain
-                        gainNode.gain.value = gainValue;
-                        
-                        // Connect the nodes
-                        source.connect(gainNode);
-                        gainNode.connect(destination);
-                        
-                        // Replace the audio track in the stream
-                        const enhancedStream = new MediaStream();
-                        const videoTracks = roomSession.localStream.getVideoTracks();
-                        const enhancedAudioTrack = destination.stream.getAudioTracks()[0];
-                        
-                        // Add the enhanced audio track
-                        enhancedStream.addTrack(enhancedAudioTrack);
-                        
-                        // Add video tracks if any
-                        videoTracks.forEach(track => {
-                            enhancedStream.addTrack(track);
-                        });
-                        
-                        // Update the room session's local stream
-                        // Note: This might not work with all WebRTC implementations
-                        // If it doesn't work, you may need to set up gain before calling dial()
-                        
-                        logEvent('Applied audio gain', { gain: gainValue });
-                    } catch (err) {
-                        logEvent('Failed to apply audio gain', { error: err.message });
-                    }
-                }
-                
-                // Disable AGC and noise suppression on audio tracks
-                audioTracks.forEach(track => {
-                    // Log the audio device being used
-                    const settings = track.getSettings();
-                    
-                    // Get device info to show if it's the default
-                    navigator.mediaDevices.enumerateDevices().then(devices => {
-                        const audioInputs = devices.filter(d => d.kind === 'audioinput');
-                        const currentDevice = audioInputs.find(d => d.deviceId === settings.deviceId);
-                        const isDefault = settings.deviceId === 'default' || 
-                                        (currentDevice && currentDevice.deviceId === 'default');
-                        
-                        logEvent('Audio input device', {
-                            label: track.label,
-                            deviceId: settings.deviceId,
-                            isSystemDefault: isDefault,
-                            groupId: settings.groupId,
-                            sampleRate: settings.sampleRate,
-                            channelCount: settings.channelCount
-                        });
-                    });
-                    
-                    // Apply constraints to disable AGC and noise suppression
-                    track.applyConstraints({
-                        autoGainControl: false,
-                        echoCancellation: true,
-                        noiseSuppression: false
-                    }).then(() => {
-                        logEvent(`Disabled AGC and noise suppression on audio track: ${track.label}`);
-                    }).catch(err => {
-                        logEvent(`Failed to disable AGC/noise suppression: ${err.message}`);
-                    });
-                });
-                
-                // Check if we should start muted
-                if (startMutedCheckbox.checked) {
-                    audioTracks.forEach(track => {
-                        track.enabled = false;
-                        logEvent(`Muted audio track: ${track.label}`);
-                    });
-                    isMuted = true;
-                    muteBtn.textContent = 'Unmute';
-                    logEvent('Started call muted as requested');
-                }
-            }
-        }, 50); // Check every 50ms
-        
-        // Store interval for cleanup
-        roomSession._streamCheckInterval = checkLocalStream;
-
-        // Note: user_event comes through the client, not roomSession
-        // Commenting out roomSession listener as per user guidance
-        /*
-        roomSession.on('user_event', (params) => {
-            console.log('🟢 ROOMSESSION EVENT: user_event', params);
-            logEvent('user_event on roomSession', params);
-            handleUserEvent(params);
-        });
-        */
-
-        // Monitor all roomSession events
-        const originalRoomEmit = roomSession.emit;
-        roomSession.emit = function(event, ...args) {
-            if (!event.includes('member.updated') && event !== 'call.joined') {
-                // Log only safe properties to avoid circular references
-                const safeData = args[0] ? {
-                    type: args[0].type,
-                    event_type: args[0].event_type,
-                    params: args[0].params,
-                    // Add other safe properties as needed
-                    hasCallObject: !!args[0].call,
-                    hasMemberObject: !!args[0].member
-                } : args[0];
-                logEvent(`RoomSession event: ${event}`, safeData);
-            }
-            return originalRoomEmit.apply(this, [event, ...args]);
-        };
-        
-        // Start the call - this might be needed based on the widget code
-        logEvent('Starting call...');
-        await roomSession.start();
-        
     } catch (error) {
-        logEvent('Connection error', { error: error.message, stack: error.stack });
-        statusDiv.textContent = 'Connection failed';
-        // Reset connect button
-        connectBtn.disabled = false;
-        connectBtn.textContent = 'Connect';
-        connectBtn.style.cssText = ''; // Clear all inline styles
-        connectBtn.style.display = 'inline-block';
-        hangupBtn.style.display = 'none';
+        logEvent('Connection error', { error: error.message });
+        statusDiv.textContent = 'Connection failed: ' + error.message;
+        handleDisconnect();
     }
 }
 
 function handleDisconnect() {
-    // Clean up stream check interval
-    if (roomSession && roomSession._streamCheckInterval) {
-        clearInterval(roomSession._streamCheckInterval);
-    }
-    
-    // Clean up local video preview
+    if (teardownDone) return;
+    teardownDone = true;
+
+    // Unsubscribe every tracked RxJS subscription
+    subscriptions.forEach(s => { try { s.unsubscribe(); } catch (e) {} });
+    subscriptions = [];
+
+    // Local preview cleanup — tracks are owned by the call, so just detach
     const localVideoContainer = document.getElementById('local-video-container');
     const localVideo = document.getElementById('local-video');
     if (localVideo && localVideo.srcObject) {
-        // Stop all tracks in the cloned stream
-        const tracks = localVideo.srcObject.getTracks();
-        tracks.forEach(track => track.stop());
         localVideo.srcObject = null;
-        logEvent('Local video preview stopped');
     }
     if (localVideoContainer) {
         localVideoContainer.style.display = 'none';
         localVideoContainer.classList.remove('connected');
     }
-    
-    // Clean up remote video element if it exists
+    currentLocalStream = null;
+
+    // Remote video cleanup
     const videoContainer = document.getElementById('video-container');
     if (videoContainer) {
-        // Remove any video elements that SignalWire might have added
-        const videos = videoContainer.querySelectorAll('video');
-        videos.forEach(video => {
-            if (video.srcObject) {
-                const tracks = video.srcObject.getTracks();
-                tracks.forEach(track => track.stop());
-                video.srcObject = null;
-            }
-            video.remove();
+        videoContainer.querySelectorAll('video').forEach(v => {
+            v.srcObject = null;
+            v.remove();
         });
-        
-        // Also remove any wrapper divs SignalWire might have added
-        videoContainer.innerHTML = '';
-        logEvent('Cleaned up remote video elements');
     }
-    
-    // Clean up client
+    remoteVideoEl = null;
+    lastRemoteSig = '';
+
+    // Disconnect the client
     if (client) {
-        client.disconnect();
+        try { client.disconnect(); } catch (e) {}
         client = null;
     }
-    roomSession = null;
+    call = null;
+
     statusDiv.textContent = 'Disconnected';
     // Reset connect button
     connectBtn.disabled = false;
     connectBtn.textContent = 'Connect';
-    connectBtn.style.cssText = ''; // Clear all inline styles
+    connectBtn.style.cssText = '';
     connectBtn.style.display = 'inline-block';
     hangupBtn.style.display = 'none';
     muteBtn.style.display = 'none';
     muteBtn.textContent = 'Mute';
     isMuted = false;
     clearCards();
-    
+
     // Remove connected class to restore normal spacing
     const controlsContainer = document.querySelector('.controls-container');
-    if (controlsContainer) {
-        controlsContainer.classList.remove('connected');
-    }
-    
+    if (controlsContainer) controlsContainer.classList.remove('connected');
+
     // Restore button text
     hangupBtn.textContent = 'Leave';
     muteBtn.textContent = 'Mute';
-    
+
     // Show the deck placeholder again
     const deckPlaceholder = document.getElementById('deck-placeholder');
-    if (deckPlaceholder) {
-        deckPlaceholder.style.display = 'block';
-    }
-    
+    if (deckPlaceholder) deckPlaceholder.style.display = 'block';
+
     logEvent('Disconnected - ready for new connection');
 }
 
 async function hangup() {
-    if (roomSession) {
+    if (call) {
         try {
-            await roomSession.hangup();
+            await call.hangup();
         } catch (e) {
             logEvent('Hangup error', { error: e.message });
         }
@@ -610,7 +373,7 @@ async function hangup() {
 
 function handleUserEvent(eventData) {
     logEvent('Processing user event', eventData, true);
-    
+
     // Also log to console for debugging
     console.log('🎯 USER EVENT RECEIVED IN HANDLER:');
     console.log('Event Data:', eventData);
@@ -618,7 +381,7 @@ function handleUserEvent(eventData) {
     console.log('Event Payload:', eventData?.payload);
     console.log('Full Event Object:', JSON.stringify(eventData, null, 2));
     console.log('----------------------------');
-    
+
     if (eventData.type === 'show_tarot_cards' && eventData.reading) {
         console.log('📋 Showing tarot cards:', eventData.reading);
         logEvent('Showing tarot cards', null, true);
@@ -644,7 +407,7 @@ function handleUserEvent(eventData) {
 
 function dealCards(reading) {
     const positions = ['past', 'present', 'future'];
-    
+
     positions.forEach((position, index) => {
         setTimeout(() => {
             if (reading[position]) {
@@ -661,50 +424,50 @@ function dealCards(reading) {
 function createCard(position, cardData) {
     const slot = document.getElementById(`${position}-slot`);
     const placeholder = slot.querySelector('.card-placeholder');
-    
+
     // Remove existing card if present
     const existingCard = document.getElementById(`${position}-card`);
     if (existingCard) {
         existingCard.remove();
     }
-    
+
     cards[position] = cardData;
-    
+
     // Log card data for debugging
     logEvent(`Creating ${position} card`, {
         name: cardData.name,
         image: cardData.image,
         reversed: cardData.reversed
     });
-    
+
     const card = document.createElement('div');
     card.className = 'tarot-card dealing';
     card.id = `${position}-card`;
-    
+
     const cardBack = document.createElement('div');
     cardBack.className = 'card-face card-back';
-    
+
     const cardFront = document.createElement('div');
     cardFront.className = 'card-face card-front';
-    
+
     // Construct the full image URL
     const imageUrl = cardData.image.startsWith('http') ? cardData.image : `${BASE_URL}/${cardData.image}`;
-    
+
     // Log the constructed URL
     logEvent(`Image URL for ${position}`, { url: imageUrl });
-    
+
     // Apply rotation if card is reversed (upside down) - combine with scale
     const imageStyle = cardData.reversed ? 'transform: scale(1.06) rotate(180deg);' : '';
-    
+
     cardFront.innerHTML = `
-        <img class="card-image${cardData.reversed ? ' reversed' : ''}" src="${imageUrl}" alt="${cardData.name}" style="${imageStyle}" 
+        <img class="card-image${cardData.reversed ? ' reversed' : ''}" src="${imageUrl}" alt="${cardData.name}" style="${imageStyle}"
              onload="console.log('Image loaded:', '${imageUrl}')"
              onerror="console.log('Image failed:', '${imageUrl}'); this.src='data:image/svg+xml,%3Csvg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"150\" viewBox=\"0 0 100 150\"%3E%3Crect width=\"100\" height=\"150\" fill=\"%23ddd\"%2F%3E%3Ctext x=\"50\" y=\"75\" text-anchor=\"middle\" fill=\"%23666\" font-size=\"12\"%3E${encodeURIComponent(cardData.name)}%3C/text%3E%3C/svg%3E'">
     `;
-    
+
     card.appendChild(cardBack);
     card.appendChild(cardFront);
-    
+
     placeholder.style.display = 'none';
     slot.appendChild(card);
 }
@@ -719,7 +482,7 @@ function flipCard(position) {
 
 function revealCardArea() {
     const tarotTable = document.getElementById('tarot-table');
-    
+
     tarotTable.classList.remove('hidden');
     tarotTable.classList.add('visible');
     cardsRevealed = true;
@@ -727,7 +490,7 @@ function revealCardArea() {
 
 function hideCardArea() {
     const tarotTable = document.getElementById('tarot-table');
-    
+
     tarotTable.classList.remove('visible');
     tarotTable.classList.add('hidden');
     cardsRevealed = false;
@@ -738,14 +501,14 @@ function clearCards() {
         const slot = document.getElementById(`${position}-slot`);
         const card = document.getElementById(`${position}-card`);
         const placeholder = slot.querySelector('.card-placeholder');
-        
+
         if (card) {
             card.remove();
         }
         if (placeholder) {
             placeholder.style.display = 'flex';
         }
-        
+
         cards[position] = null;
     });
     setTimeout(() => {
@@ -753,32 +516,41 @@ function clearCards() {
     }, 1000);
 }
 
-// Mute/unmute functions
-function toggleMute() {
+// Mute/unmute — v4: server-side self.mute()/unmute() with a local-track fallback
+async function toggleMute() {
     try {
-        // The localStream should be stored on the roomSession
-        if (roomSession && roomSession.localStream) {
-            const audioTracks = roomSession.localStream.getAudioTracks();
-            
-            // Toggle each audio track
-            audioTracks.forEach(track => {
-                track.enabled = !track.enabled;
-                logEvent(`Audio track ${track.label} enabled: ${track.enabled}`);
-            });
-            
-            // Update UI based on first track state
-            if (audioTracks.length > 0) {
-                isMuted = !audioTracks[0].enabled;
-                if (window.innerWidth <= 768 && document.getElementById('control-panel').classList.contains('connected')) {
-                    muteBtn.textContent = isMuted ? '🔊' : '🔇';
-                } else {
-                    muteBtn.textContent = isMuted ? 'Unmute' : 'Mute';
-                }
-                logEvent(isMuted ? 'Microphone muted' : 'Microphone unmuted');
-            }
-        } else {
-            logEvent('No local stream found on roomSession');
+        if (!call) {
+            logEvent('No active call to mute');
+            return;
         }
+        const wantMuted = !isMuted;
+        let ok = false;
+        try {
+            if (wantMuted) {
+                await call.self.mute();
+            } else {
+                await call.self.unmute();
+            }
+            ok = true;
+        } catch (e) {
+            logEvent('Server mute failed, falling back to local track', { error: e.message });
+        }
+
+        if (!ok) {
+            // Local fallback: toggle the outbound audio tracks
+            const stream = currentLocalStream;
+            const tracks = stream ? stream.getAudioTracks() : [];
+            tracks.forEach(t => { t.enabled = !wantMuted; });
+        }
+
+        isMuted = wantMuted;
+        const controlPanel = document.getElementById('control-panel');
+        if (window.innerWidth <= 768 && controlPanel && controlPanel.classList.contains('connected')) {
+            muteBtn.textContent = isMuted ? '🔊' : '🔇';
+        } else {
+            muteBtn.textContent = isMuted ? 'Unmute' : 'Mute';
+        }
+        logEvent(isMuted ? 'Microphone muted' : 'Microphone unmuted');
     } catch (error) {
         logEvent('Mute toggle error', { error: error.message });
     }

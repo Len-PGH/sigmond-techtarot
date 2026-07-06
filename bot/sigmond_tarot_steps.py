@@ -10,8 +10,8 @@ import secrets
 import os
 import argparse
 from pathlib import Path
-from signalwire_agents import AgentBase
-from signalwire_agents.core.function_result import SwaigFunctionResult
+from signalwire import AgentBase
+from signalwire.core.function_result import SwaigFunctionResult
 from fastapi import Request, Response
 
 # Use cryptographically secure random for better randomness
